@@ -1,64 +1,81 @@
+import random
+import torch
+import numpy as np
 from agents.agent import Agent
 from gym_env import PokerEnv
-import random
+
+# Import the helper functions and PolicyNetwork from the training file.
+# Adjust the import path as needed.
+from train_rl_agent import PolicyNetwork, preprocess_observation
 
 action_types = PokerEnv.ActionType
+int_to_card = PokerEnv.int_to_card
 
 
 class PlayerAgent(Agent):
     def __name__(self):
         return "PlayerAgent"
 
-    def __init__(self, stream: bool = True):
+    def __init__(self, stream: bool = False):
         super().__init__(stream)
-        # Initialize any instance variables here
-        self.hand_number = 0
-        self.last_action = None
-        self.won_hands = 0
+        weight_path = "rl_agent_weights.pth"
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Initialize the policy network with the same dimensions as during training.
+        self.policy_net = PolicyNetwork(input_dim=13)
+        torch.load(weight_path, map_location=self.device)
+        self.policy_net.load_state_dict(
+            torch.load(weight_path, map_location=self.device)
+        )
+        self.policy_net.to(self.device)
+        self.policy_net.eval()
+
+    def select_action(self, state, valid_actions, min_raise, max_raise):
+        """
+        Same as during training, but without gradient tracking.
+        """
+        with torch.no_grad():
+            action_type_logits, raise_logits, discard_logits = self.policy_net(state)
+            mask = valid_actions == 0
+            masked_logits = action_type_logits.clone()
+            masked_logits[mask] = -1e9
+
+            action_type_dist = torch.distributions.Categorical(logits=masked_logits)
+            raise_dist = torch.distributions.Categorical(logits=raise_logits)
+            discard_dist = torch.distributions.Categorical(logits=discard_logits)
+
+            action_type = action_type_dist.sample()
+            raise_amount = raise_dist.sample()
+            discard_action = discard_dist.sample()
+
+            action_type = action_type.item()
+            raise_amount = raise_amount.item() + 1
+            if action_type == PokerEnv.ActionType.RAISE.value:
+                raise_amount = int(max(min(raise_amount, max_raise), min_raise))
+            else:
+                raise_amount = 0
+
+            discard_action = discard_action.item() - 1
+            if action_type == PokerEnv.ActionType.DISCARD.value:
+                if discard_action < 0:
+                    discard_action = 0
+            else:
+                discard_action = -1
+
+            return (action_type, raise_amount, discard_action)
 
     def act(self, observation, reward, terminated, truncated, info):
-        # Example of using the logger
-        if observation["street"] == 0 and info["hand_number"] % 50 == 0:
-            self.logger.info(f"Hand number: {info['hand_number']}")
-
-        # First, get the list of valid actions we can take
-        valid_actions = observation["valid_actions"]
-        
-        # Get indices of valid actions (where value is 1)
-        valid_action_indices = [i for i, is_valid in enumerate(valid_actions) if is_valid]
-        
-        # Randomly choose one of the valid action indices
-        action_type = random.choice(valid_action_indices)
-        
-        # Set up our response values
-        raise_amount = 0
-        card_to_discard = -1  # -1 means no discard
-        
-        # If we chose to raise, pick a random amount between min and max
-        if action_type == action_types.RAISE.value:
-            if observation["min_raise"] == observation["max_raise"]:
-                raise_amount = observation["min_raise"]
-            else:
-                raise_amount = random.randint(
-                    observation["min_raise"],
-                    observation["max_raise"]
-                )
-        
-        # If we chose to discard, randomly pick one of our two cards (0 or 1)
-        if action_type == action_types.DISCARD.value:
-            card_to_discard = random.randint(0, 1)
-        
-        return action_type, raise_amount, card_to_discard
+        # Preprocess the observation.
+        state = preprocess_observation(observation).to(self.device)
+        valid_actions_tensor = torch.tensor(
+            observation["valid_actions"], dtype=torch.float32
+        ).to(self.device)
+        min_raise_val = observation["min_raise"]
+        max_raise_val = observation["max_raise"]
+        action = self.select_action(
+            state, valid_actions_tensor, min_raise_val, max_raise_val
+        )
+        return action
 
     def observe(self, observation, reward, terminated, truncated, info):
-        # Log interesting events when observing opponent's actions
-        pass
-        if terminated:
-            self.logger.info(f"Game ended with reward: {reward}")
-            self.hand_number += 1
-            if reward > 0:
-                self.won_hands += 1
-            self.last_action = None
-        else:
-            # log observation keys
-            self.logger.info(f"Observation keys: {observation}")
+        if terminated and abs(reward) > 20:
+            self.logger.info(f"Significant hand completed with reward: {reward}")
